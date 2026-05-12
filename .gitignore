@@ -1,0 +1,44 @@
+# -*- coding: utf-8 -*-
+# Git 忽略文件 - 防止敏感信息泄露
+
+# 配置文件（包含敏感信息）
+config.py
+
+# SSH 密钥
+id_ed25519
+id_ed25519.pub
+*.pem
+*.key
+
+# 备份文件
+backup/
+tmp/
+*.zip
+
+# 日志文件
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
