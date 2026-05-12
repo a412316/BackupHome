@@ -56,10 +56,10 @@ class BackupClient:
             else:
                 self.sftp.get(remotepath=remote_item_path, localpath=local_item_path)
 
-    def exec_command(self, cmd: str) -> tuple[str, str, str]:
+    def exec_command(self, cmd: str) -> tuple[str, str]:
         stdin, stdout, stderr = self.ssh.exec_command(cmd)
         return (
-            stdin.read().decode() if stdin else '',
+            # stdin.read().decode() if stdin else '',
             stdout.read().decode(),
             stderr.read().decode()
         )
@@ -116,10 +116,10 @@ class OracleBackup:
         local_path.mkdir(parents=True, exist_ok=True)
 
         cmd = 'docker exec -u git -w /tmp $(docker ps -qf "name=gitea") bash -c "/usr/local/bin/gitea dump -c /data/gitea/conf/app.ini"'
-        _, stdout, stderr = self.client.exec_command(cmd)
+        stdout, stderr = self.client.exec_command(cmd)
 
         dump_file_path = None
-        for line in stdout.splitlines():
+        for line in (stdout + stderr).splitlines():
             if 'Finish dumping in file' in line:
                 match = re.search(r'/tmp/gitea-dump-\d+\.zip', line)
                 if match:
@@ -175,7 +175,7 @@ class OracleBackup:
             self.prepare_dirs()
             self.client.connect()
 
-            self.get_bitwarden_files()
+            # self.get_bitwarden_files()
             self.get_adg_folder()
             self.get_gitea_files()
 
