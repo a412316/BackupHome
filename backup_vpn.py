@@ -86,12 +86,11 @@ class VpnBackup:
         print('正在下载VPN配置文件...')
 
         vpn_files = {
-            'shadowsocks': ['/etc/shadowsocks/config.json'],
+            'xray': ['/usr/local/etc/xray/config.json'],
             'snell': ['/etc/snell/snell.conf'],
             'services': [
                 '/etc/systemd/system/shadow-tls-snell.service',
-                '/etc/systemd/system/shadow-tls.service',
-                '/etc/systemd/system/shadowsocks.service',
+                '/etc/systemd/system/xray.service',
                 '/etc/systemd/system/snell.service'
             ]
         }
