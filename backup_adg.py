@@ -93,8 +93,8 @@ class AdgBackup:
         local_path.mkdir(parents=True, exist_ok=True)
 
         file_list = [
-            '/root/AdGuardHome/AdGuardHome.yaml',
-            '/root/AdGuardHome/get_cf_ip.sh'
+            '/etc/adguardhome/AdGuardHome.yaml',
+            '/etc/adguardhome/update_github_hosts.sh'
         ]
 
         for file in file_list:
@@ -179,8 +179,8 @@ class AdgBackup:
 
             self.get_adg_files()
             self.get_nginx_files()
-            self.get_crontab()
-            self.get_adg_ssl_folder()
+            # self.get_crontab()
+            # self.get_adg_ssl_folder()
 
             print('=' * 50)
             zip_file = self.compress_backup()
