@@ -71,7 +71,7 @@ class BackupClient:
         """执行SSH命令，返回(stdin, stdout, stderr)的字符串"""
         stdin, stdout, stderr = self.ssh.exec_command(cmd)
         return (
-            stdin.read().decode() if stdin else '',
+            # stdin.read().decode() if stdin else '',
             stdout.read().decode(),
             stderr.read().decode()
         )
