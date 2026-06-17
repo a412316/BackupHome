@@ -20,8 +20,6 @@ except ImportError:
     print('请复制 config.example.py 为 config.py 并填入实际配置')
     sys.exit(1)
 
-from backup_engine import BackupTask
-
 
 class BackupRunner:
     """备份运行器：按 config 声明依次执行各模块。"""
@@ -44,6 +42,7 @@ class BackupRunner:
         print(f'{"=" * 60}')
 
         try:
+            from backup_engine import BackupTask  # 延迟导入：--list/--help 无需 paramiko
             task = BackupTask(
                 module_id=module_id,
                 module_config=module_config,
