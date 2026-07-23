@@ -107,6 +107,12 @@ class BackupClient:
         except IOError:
             return []
 
+    def listdir_attr(self, remote_path: str) -> list:
+        try:
+            return self.sftp.listdir_attr(remote_path)
+        except IOError:
+            return []
+
     def file_exists(self, remote_path: str) -> bool:
         try:
             self.sftp.stat(remote_path)
@@ -256,11 +262,18 @@ class BackupTask:
         remote_dirs = op.get('remote_dirs') or [op['remote_dir']]
 
         for remote_dir in remote_dirs:
-            for filename in self.client.listdir(remote_dir):
-                if pattern.search(filename):
-                    remote_file = f"{remote_dir}/{filename}"
-                    local_file = dest / filename
-                    if self.client.download_file(remote_file, str(local_file)):
+            for item in self.client.listdir_attr(remote_dir):
+                filename = item.filename
+                if not pattern.search(filename):
+                    continue
+                remote_path = f"{remote_dir}/{filename}"
+                local_path = dest / filename
+                if stat.S_ISDIR(item.st_mode):
+                    os.makedirs(local_path, exist_ok=True)
+                    self.client.download_folder(remote_path, str(local_path))
+                    print(f'  ✓ 已下载文件夹: {filename}')
+                else:
+                    if self.client.download_file(remote_path, str(local_path)):
                         print(f'  ✓ 已下载: {filename}')
                     else:
                         print(f'  ✗ 下载失败: {filename}')
