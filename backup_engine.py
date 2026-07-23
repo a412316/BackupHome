@@ -92,6 +92,8 @@ class BackupClient:
 
     def download_folder(self, remote_path: str, local_path: str) -> None:
         for item in self.sftp.listdir_attr(remote_path):
+            if stat.S_ISLNK(item.st_mode):
+                continue
             remote_item_path = f"{remote_path}/{item.filename}"
             local_item_path = os.path.join(local_path, item.filename)
 
@@ -262,21 +264,27 @@ class BackupTask:
         remote_dirs = op.get('remote_dirs') or [op['remote_dir']]
 
         for remote_dir in remote_dirs:
+            dir_name = Path(remote_dir).name
+            dir_dest = dest / dir_name
+            dir_dest.mkdir(parents=True, exist_ok=True)
+
             for item in self.client.listdir_attr(remote_dir):
                 filename = item.filename
+                if stat.S_ISLNK(item.st_mode):
+                    continue
                 if not pattern.search(filename):
                     continue
                 remote_path = f"{remote_dir}/{filename}"
-                local_path = dest / filename
+                local_path = dir_dest / filename
                 if stat.S_ISDIR(item.st_mode):
                     os.makedirs(local_path, exist_ok=True)
                     self.client.download_folder(remote_path, str(local_path))
-                    print(f'  ✓ 已下载文件夹: {filename}')
+                    print(f'  ✓ 已下载文件夹: {dir_name}/{filename}')
                 else:
                     if self.client.download_file(remote_path, str(local_path)):
-                        print(f'  ✓ 已下载: {filename}')
+                        print(f'  ✓ 已下载: {dir_name}/{filename}')
                     else:
-                        print(f'  ✗ 下载失败: {filename}')
+                        print(f'  ✗ 下载失败: {dir_name}/{filename}')
 
     def _op_command_output_to_file(self, op: dict) -> None:
         dest_dir = self._dest_dir(op)
