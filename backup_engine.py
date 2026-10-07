@@ -42,6 +42,8 @@ class BackupClient:
 
         key_file = ssh_config.get('key_file', 'id_ed25519')
         self.ssh_key_path = Path(__file__).parent.absolute() / key_file
+        known_hosts = ssh_config.get('known_hosts', 'known_hosts')
+        self.known_hosts_path = Path(__file__).parent.absolute() / known_hosts
 
         self.ssh: Optional[paramiko.SSHClient] = None
         self.sftp: Optional[paramiko.SFTPClient] = None
@@ -49,30 +51,52 @@ class BackupClient:
     def connect(self) -> None:
         print(f'正在连接服务器 {self.host}...')
         self.ssh = paramiko.SSHClient()
-        self.ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        if self.auth == 'password':
-            # 密码认证（如交换机），不使用密钥代理，也不打开 SFTP
-            self.ssh.connect(
-                hostname=self.host,
-                port=self.port,
-                username=self.user,
-                password=self.password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False,
+        # 校验主机指纹，防止中间人攻击：不自动信任未知主机，也不接受指纹变化
+        if not self.known_hosts_path.is_file():
+            raise FileNotFoundError(
+                f'known_hosts 文件不存在: {self.known_hosts_path}\n'
+                f'首次使用请先采集主机指纹: '
+                f'ssh-keyscan -p {self.port} {self.host} >> {self.known_hosts_path}'
             )
-        else:
-            # 密钥认证，并打开 SFTP 供文件下载使用
-            key = paramiko.Ed25519Key.from_private_key_file(self.ssh_key_path)
-            self.ssh.connect(
-                hostname=self.host,
-                port=self.port,
-                username=self.user,
-                pkey=key,
-                timeout=self.timeout,
-            )
-            self.sftp = self.ssh.open_sftp()
+        self.ssh.load_host_keys(str(self.known_hosts_path))
+        self.ssh.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+        try:
+            if self.auth == 'password':
+                # 密码认证（如交换机），不使用密钥代理，也不打开 SFTP
+                self.ssh.connect(
+                    hostname=self.host,
+                    port=self.port,
+                    username=self.user,
+                    password=self.password,
+                    timeout=self.timeout,
+                    look_for_keys=False,
+                    allow_agent=False,
+                )
+            else:
+                # 密钥认证，并打开 SFTP 供文件下载使用
+                key = paramiko.Ed25519Key.from_private_key_file(self.ssh_key_path)
+                self.ssh.connect(
+                    hostname=self.host,
+                    port=self.port,
+                    username=self.user,
+                    pkey=key,
+                    timeout=self.timeout,
+                )
+                self.sftp = self.ssh.open_sftp()
+        except paramiko.BadHostKeyException as e:
+            raise ConnectionError(
+                f'主机 {self.host} 的指纹与 known_hosts 记录不一致，'
+                f'可能存在中间人攻击，连接已拒绝。确认安全后可更新指纹: {e}'
+            ) from e
+        except paramiko.SSHException as e:
+            if 'No host key' in str(e):
+                raise ConnectionError(
+                    f'known_hosts 中没有主机 {self.host} 的指纹，请先执行: '
+                    f'ssh-keyscan -p {self.port} {self.host} >> {self.known_hosts_path}'
+                ) from e
+            raise
         print('连接成功！')
 
     def close(self) -> None:
@@ -94,6 +118,8 @@ class BackupClient:
         for item in self.sftp.listdir_attr(remote_path):
             if stat.S_ISLNK(item.st_mode):
                 continue
+            if item.filename in ('.', '..') or '/' in item.filename or '\\' in item.filename:
+                continue  # 防御异常文件名，避免本地写入越界
             remote_item_path = f"{remote_path}/{item.filename}"
             local_item_path = os.path.join(local_path, item.filename)
 
@@ -123,9 +149,10 @@ class BackupClient:
             return False
 
     def exec_command(self, cmd: str) -> tuple:
-        """执行命令，返回 (stdout, stderr)。"""
+        """执行命令，返回 (exit_status, stdout, stderr)。"""
         _, stdout, stderr = self.ssh.exec_command(cmd)
-        return stdout.read().decode(), stderr.read().decode()
+        exit_status = stdout.channel.recv_exit_status()
+        return exit_status, stdout.read().decode(errors='replace'), stderr.read().decode(errors='replace')
 
     def exec_command_with_pty(self, cmd: str, input_data: str = '') -> tuple:
         """以 PTY 方式执行命令，返回 (exit_status, stdout, stderr)。"""
@@ -154,11 +181,19 @@ class BackupTask:
         self.tmp_path = tmp_root / self.tmp_subdir
         self.backup_path = self.base_path / paths_config.get('backup_dir', 'backup')
 
+        # 本次运行中失败的操作描述，非空则整个模块记为失败
+        self.failed_items = []
+
         self.client = BackupClient(self.target, ssh_config)
+
+    def _record_failure(self, message: str) -> None:
+        self.failed_items.append(message)
 
     # ------------------------------------------------------------------ 公共流程
 
     def prepare_dirs(self) -> None:
+        # 清掉上次运行（含失败）残留的临时目录，避免旧文件混入本次备份
+        shutil.rmtree(self.tmp_path, ignore_errors=True)
         self.tmp_path.mkdir(parents=True, exist_ok=True)
         self.backup_path.mkdir(parents=True, exist_ok=True)
 
@@ -180,6 +215,8 @@ class BackupTask:
         return zip_filepath
 
     def cleanup_temp(self) -> None:
+        if not self.tmp_path.exists():
+            return
         print('正在清理临时文件夹...')
         try:
             shutil.rmtree(self.tmp_path)
@@ -199,6 +236,11 @@ class BackupTask:
             for op in self.operations:
                 self.dispatch(op)
 
+            if self.failed_items:
+                print('\n⚠ 本次备份有失败项:')
+                for msg in self.failed_items:
+                    print(f'  - {msg}')
+
             print('=' * 50)
             zip_file = self.compress_backup()
 
@@ -207,13 +249,13 @@ class BackupTask:
             print(f'备份文件位置: {zip_file}')
             print('=' * 50)
 
-            self.cleanup_temp()
-
         except Exception as e:
             print(f'备份过程出错: {e}')
             raise
         finally:
+            # 无论成败都清理：临时目录里是敏感数据，不应残留
             self.client.close()
+            self.cleanup_temp()
 
     # ------------------------------------------------------------------ 操作分发
 
@@ -226,15 +268,28 @@ class BackupTask:
         handler(op)
 
     def _dest_dir(self, op: dict) -> Path:
-        dest = self.tmp_path / op.get('dest_subdir', '')
+        dest = self._safe_local_path(self.tmp_path, op.get('dest_subdir', ''))
         dest.mkdir(parents=True, exist_ok=True)
         return dest
+
+    def _safe_local_path(self, base: Path, name: str) -> Path:
+        """拼接本地路径并确保结果仍位于 tmp 目录内，防止路径穿越。"""
+        target = (base / name).resolve()
+        tmp_root = self.tmp_path.resolve()
+        if tmp_root != target and tmp_root not in target.parents:
+            raise ValueError(f'路径越出临时目录，疑似路径穿越: {name!r}')
+        return target
 
     # ------------------------------------------------------------------ 操作处理器
 
     def _op_run_command(self, op: dict) -> None:
-        self.client.exec_command(op['command'])
-        print('  命令已执行')
+        exit_status, _, stderr = self.client.exec_command(op['command'])
+        if exit_status != 0:
+            detail = stderr.strip() or op['command']
+            self._record_failure(f'run_command 失败 (exit {exit_status}): {detail}')
+            print(f'  ✗ 命令执行失败 (exit {exit_status}): {stderr.strip()}')
+        else:
+            print('  命令已执行')
 
     def _op_download_files(self, op: dict) -> None:
         dest = self._dest_dir(op)
@@ -242,7 +297,7 @@ class BackupTask:
 
         for remote_file in op['files']:
             file_name = Path(remote_file).name
-            local_file = dest / file_name
+            local_file = self._safe_local_path(dest, file_name)
 
             if check_exists and not self.client.file_exists(remote_file):
                 print(f'  ✗ 文件不存在: {file_name}')
@@ -251,6 +306,7 @@ class BackupTask:
             if self.client.download_file(remote_file, str(local_file)):
                 print(f'  ✓ 已下载: {file_name}')
             else:
+                self._record_failure(f'下载失败: {remote_file}')
                 print(f'  ✗ 下载失败: {file_name}')
 
     def _op_download_folder(self, op: dict) -> None:
@@ -275,7 +331,7 @@ class BackupTask:
                 if not pattern.search(filename):
                     continue
                 remote_path = f"{remote_dir}/{filename}"
-                local_path = dir_dest / filename
+                local_path = self._safe_local_path(dir_dest, filename)
                 if stat.S_ISDIR(item.st_mode):
                     os.makedirs(local_path, exist_ok=True)
                     self.client.download_folder(remote_path, str(local_path))
@@ -284,20 +340,21 @@ class BackupTask:
                     if self.client.download_file(remote_path, str(local_path)):
                         print(f'  ✓ 已下载: {dir_name}/{filename}')
                     else:
+                        self._record_failure(f'下载失败: {remote_path}')
                         print(f'  ✗ 下载失败: {dir_name}/{filename}')
 
     def _op_command_output_to_file(self, op: dict) -> None:
         dest_dir = self._dest_dir(op)
-        dest_file = dest_dir / op['dest_file']
+        # dest_file 收敛为纯文件名（不允许子目录/穿越），再校验落在 tmp 内
+        dest_file = self._safe_local_path(dest_dir, Path(op['dest_file']).name)
 
-        stdout, _ = self.client.exec_command(op['command'])
+        exit_status, stdout, _ = self.client.exec_command(op['command'])
         lines = stdout.splitlines()
 
         if op.get('skip_blank_and_comments'):
             lines = [ln for ln in lines if ln and not ln.lstrip().startswith('#')]
 
-        with open(dest_file, 'w', encoding='utf8') as f:
-            f.write('\n'.join(lines))
+        dest_file.write_text('\n'.join(lines), encoding='utf8')
         print(f'  已保存: {op["dest_file"]}')
 
     def _op_command_then_download(self, op: dict) -> None:
@@ -307,7 +364,7 @@ class BackupTask:
         marker = op.get('match_marker')
         use_group = 1 if op.get('parse_group') is not None else (1 if regex.groups > 0 else 0)
 
-        stdout, stderr = self.client.exec_command(op['command'])
+        exit_status, stdout, stderr = self.client.exec_command(op['command'])
         dump_path = None
         for line in (stdout + stderr).splitlines():
             if marker and marker not in line:
@@ -318,18 +375,30 @@ class BackupTask:
                 break
 
         if not dump_path:
+            self._record_failure(
+                f'未解析到目标文件路径 (exit {exit_status}): {op["command"][:80]}'
+            )
             print('  未解析到目标文件路径')
             return
 
         copy_cmd_tpl = op.get('copy_command')
         if copy_cmd_tpl:
-            self.client.exec_command(copy_cmd_tpl.format(dump_path=dump_path))
+            exit_status, _, stderr = self.client.exec_command(
+                copy_cmd_tpl.format(dump_path=dump_path)
+            )
+            if exit_status != 0:
+                self._record_failure(
+                    f'copy_command 失败 (exit {exit_status}): {stderr.strip()}'
+                )
+                print(f'  ✗ 拷贝到宿主机失败: {stderr.strip()}')
+                return
 
         file_name = Path(dump_path).name
-        local_file = dest / file_name
+        local_file = self._safe_local_path(dest, file_name)
         if self.client.download_file(dump_path, str(local_file)):
             print(f'  ✓ 已下载: {file_name}')
         else:
+            self._record_failure(f'下载失败: {dump_path}')
             print(f'  ✗ 下载失败: {file_name}')
 
     def _op_vzdump_backup(self, op: dict) -> None:
@@ -348,6 +417,7 @@ class BackupTask:
                 cmd_tpl.format(id=lxc_id), pty_input
             )
             if exit_status != 0:
+                self._record_failure(f'vzdump LXC {lxc_id} 失败 (exit {exit_status})')
                 print(f'  备份 LXC {lxc_id} 失败 (exit {exit_status})')
                 continue
             for line in stdout.splitlines():
@@ -359,16 +429,18 @@ class BackupTask:
                         break
 
         if not remote_files:
+            self._record_failure('vzdump 没有成功创建任何备份文件')
             print('  没有成功创建任何备份文件')
             return
 
         print('正在下载备份文件...')
         for remote_file in remote_files:
             file_name = Path(remote_file).name
-            local_file = dest / file_name
+            local_file = self._safe_local_path(dest, file_name)
             if self.client.download_file(remote_file, str(local_file)):
                 print(f'  ✓ 已下载: {file_name}')
             else:
+                self._record_failure(f'下载失败: {remote_file}')
                 print(f'  ✗ 下载失败: {file_name}')
 
         if op.get('cleanup_remote'):
@@ -380,7 +452,8 @@ class BackupTask:
     def _op_interactive_shell(self, op: dict) -> None:
         """交换机等交互式设备：invoke_shell 登录 -> 采集命令 -> 清洗输出 -> 存盘。"""
         dest_dir = self._dest_dir(op)
-        dest_file = dest_dir / op['dest_file']
+        # dest_file 收敛为纯文件名（不允许子目录/穿越），再校验落在 tmp 内
+        dest_file = self._safe_local_path(dest_dir, Path(op['dest_file']).name)
 
         shell = self.client.ssh.invoke_shell()
         self._drain(shell, op.get('login_wait', 1.0))
@@ -407,11 +480,16 @@ class BackupTask:
             while shell.recv_ready():
                 output += shell.recv(4096).decode('utf-8', errors='ignore')
 
+        if len(output) < op.get('min_output', 100):
+            self._record_failure(
+                f'交互式输出采集不完整 (仅 {len(output)} 字节): {op["capture_command"]}'
+            )
+            print(f'⚠ 输出疑似不完整，仅 {len(output)} 字节')
+
         print(f'输出获取完成，共 {len(output)} 字节')
 
         lines = self._clean_output(output, op.get('clean', {}))
-        with open(dest_file, 'w', encoding='utf8') as f:
-            f.write('\n'.join(lines))
+        dest_file.write_text('\n'.join(lines), encoding='utf8')
         print(f'  已保存: {op["dest_file"]}')
 
     # ------------------------------------------------------------------ 交互辅助

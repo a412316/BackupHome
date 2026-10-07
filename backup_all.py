@@ -52,6 +52,17 @@ class BackupRunner:
             )
             task.run()
 
+            if task.failed_items:
+                # 存在失败项的模块记为失败，即使 zip 已生成（内容不完整）
+                error = f"{len(task.failed_items)} 项操作失败: " + '; '.join(task.failed_items)
+                self.results[module_id] = {
+                    'success': False,
+                    'name': module_config['name'],
+                    'target': f"{target['user']}@{target['host']}",
+                    'error': error,
+                }
+                return False
+
             self.results[module_id] = {
                 'success': True,
                 'name': module_config['name'],
@@ -158,7 +169,8 @@ def main():
             success_count = sum(1 for r in runner.results.values() if r['success'])
             failed_modules = [mid for mid, r in runner.results.items() if not r['success']]
             runner._print_summary(success_count, failed_modules)
-        return 0
+        # 任一模块失败则以非零退出，便于 cron 等自动化感知
+        return 0 if all(r['success'] for r in runner.results.values()) else 1
 
     except KeyboardInterrupt:
         print('\n\n备份任务被用户中断')

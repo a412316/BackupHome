@@ -30,8 +30,9 @@
 # SSH 通用配置
 # ============================================================================
 SSH = {
-    'key_file': 'id_ed25519',  # SSH 私钥（相对于脚本目录或绝对路径）
-    'timeout': 10,             # 连接超时（秒）
+    'key_file': 'id_ed25519',    # SSH 私钥（相对于脚本目录或绝对路径）
+    'known_hosts': 'known_hosts',  # 主机指纹文件（相对于脚本目录，需先 ssh-keyscan 采集）
+    'timeout': 10,               # 连接超时（秒）
 }
 
 # ============================================================================
@@ -291,7 +292,7 @@ BACKUP_MODULES = {
             'port': 22,
             'user': 'admin',
             'auth': 'password',
-            'password': '***REMOVED***',  # 交换机使用密码认证
+            'password': 'YOUR_SWITCH_PASSWORD',  # 交换机使用密码认证（请填真实密码，勿提交）
             'description': '交换机',
         },
         'operations': [

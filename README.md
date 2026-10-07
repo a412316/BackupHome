@@ -24,6 +24,8 @@ pip install paramiko
 cp config.example.py config.py   # 复制配置模板
 vim config.py                    # 填入实际的服务器信息和凭据
 # 确保有 SSH 密钥文件（脚本目录下 id_ed25519，chmod 600）
+# 采集各主机指纹到脚本目录的 known_hosts（引擎拒绝连接未知主机）：
+ssh-keyscan -p 22 192.168.50.12 >> known_hosts
 ```
 
 ## 快速开始
@@ -43,9 +45,12 @@ python backup_all.py -m switch     # 仅备份交换机
 ### SSH 通用配置
 
 ```python
-SSH = {'key_file': 'id_ed25519', 'timeout': 10}
+SSH = {'key_file': 'id_ed25519', 'known_hosts': 'known_hosts', 'timeout': 10}
 PATHS = {'base_path': None, 'tmp_dir': 'tmp', 'backup_dir': 'backup'}
 ```
+
+引擎校验主机指纹（`RejectPolicy`）：`known_hosts` 缺失对应主机的指纹时拒绝连接，
+首次使用请用 `ssh-keyscan` 采集（见"安装"一节）。
 
 ### 模块注册表 `BACKUP_MODULES`
 
@@ -140,10 +145,16 @@ usage: backup_all.py [-h] [-a] [-m MODULE [MODULE ...]] [-l] [--base-path BASE_P
 
 ## 安全建议
 
-- 使用强密钥短语保护 SSH 私钥；`config.py` 与 `id_ed25519` 权限设为 `600`
-- 定期轮换 SSH 密钥与交换机密码
+- 使用强密钥短语保护 SSH 私钥；`config.py`、`id_ed25519` 与 `known_hosts` 权限设为 `600`
+- 定期轮换 SSH 密钥与交换机密码；凭据只写在 `config.py`，绝不提交（示例文件一律用占位符）
 - 为备份任务创建专用账户，仅授予必要权限
 - 在受信任的网络环境中运行
+- 备份 zip 为明文，内含数据库/私钥等敏感数据，请妥善保管 `backup/` 目录
+
+## 退出码
+
+`0` 全部成功；`1` 任一模块失败（含操作级失败，如文件下载失败、远程命令非零退出）；
+`130` 用户中断。适合 cron 触发后按退出码告警。
 
 ## 许可证
 
