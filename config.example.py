@@ -14,13 +14,14 @@
     zip_prefix:  压缩包名前缀（<zip_prefix>_<时间戳>.zip）
     target:      连接目标 {host, port, user, auth, password?}
                    auth: 'key'（密钥）或 'password'（密码）
-    operations:  操作列表，按顺序执行。支持 8 种类型：
+    operations:  操作列表，按顺序执行。支持 9 种类型：
       - run_command            仅执行远程命令
       - download_files         下载一组文件（可选 check_exists）
       - download_folder        递归下载目录
       - download_pattern       目录内按正则筛选下载
       - command_output_to_file 执行命令并把 stdout 存为文件
-      - command_then_download  执行命令→正则解析路径→可选 copy→下载
+      - command_then_download  执行命令→正则解析路径→可选 copy→下载（可选清理远程）
+      - sqlite_backup          远程 sqlite3 .backup 一致性快照后下载（热库安全）
       - vzdump_backup          PVE：循环 LXC 备份→下载→清理远程
       - interactive_shell      交换机：交互式登录→采集→清洗→存盘
 ============================================================================
@@ -33,15 +34,22 @@ SSH = {
     'key_file': 'id_ed25519',    # SSH 私钥（相对于脚本目录或绝对路径）
     'known_hosts': 'known_hosts',  # 主机指纹文件（相对于脚本目录，需先 ssh-keyscan 采集）
     'timeout': 10,               # 连接超时（秒）
+    # 'command_timeout': 900,   # 远程命令超时（秒，默认不限；注意 vzdump 等长任务需足够大）
 }
 
 # ============================================================================
 # 路径配置
 # ============================================================================
 PATHS = {
-    'base_path': None,   # 备份基础路径（None 表示脚本所在目录）
-    'tmp_dir': 'tmp',    # 临时文件目录名
+    'base_path': None,       # 备份基础路径（None 表示脚本所在目录；实际以 --base-path 参数为准）
+    'tmp_dir': 'tmp',        # 临时文件目录名
     'backup_dir': 'backup',  # 备份输出目录名
+    'keep_last': 10,         # 每个模块保留最近 N 个备份包（连同 .sha256），超出自动清理；None 不限制
+    # 'encrypt': {
+    #     # age 公钥加密（brew install age；age-keygen -o key.txt 生成密钥对）
+    #     'recipients': ['age1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'],
+    #     'age_bin': 'age',
+    # },
 }
 
 # ============================================================================
@@ -73,8 +81,13 @@ BACKUP_MODULES = {
                 'dest_subdir': 'Grafana',
                 'files': [
                     '/opt/1panel/apps/grafana/grafana/data/grafana.ini',
-                    '/opt/1panel/apps/grafana/grafana/data/grafana.db',
                 ],
+            },
+            {
+                # grafana.db 是 SQLite 热库，直接拉取可能损坏，用一致性快照
+                'type': 'sqlite_backup',
+                'dest_subdir': 'Grafana',
+                'db': '/opt/1panel/apps/grafana/grafana/data/grafana.db',
             },
             {
                 'type': 'download_folder',
@@ -110,10 +123,15 @@ BACKUP_MODULES = {
         },
         'operations': [
             {
+                # db.sqlite3 是 Bitwarden 的密码库热库，必须用一致性快照
+                'type': 'sqlite_backup',
+                'dest_subdir': 'bitwarden',
+                'db': '/opt/1panel/apps/bitwarden/bitwarden/data/db.sqlite3',
+            },
+            {
                 'type': 'download_files',
                 'dest_subdir': 'bitwarden',
                 'files': [
-                    '/opt/1panel/apps/bitwarden/bitwarden/data/db.sqlite3',
                     '/opt/1panel/apps/bitwarden/bitwarden/data/rsa_key.pem',
                 ],
             },
@@ -129,6 +147,9 @@ BACKUP_MODULES = {
                 'match_marker': 'Finish dumping in file',
                 'parse_regex': r'/tmp/gitea-dump-\d+\.zip',
                 'copy_command': 'docker cp $(docker ps -qf "name=gitea"):{dump_path} {dump_path}',
+                'cleanup_remote': True,  # 下载后删除宿主机 /tmp 的 dump 文件
+                # 若需同时清理容器内 /tmp，改用自定义清理命令：
+                # 'cleanup_command': 'rm -f {dump_path}; docker exec $(docker ps -qf "name=gitea") rm -f {dump_path}',
             },
         ],
     },

@@ -6,15 +6,18 @@
 - BackupTask:   通用备份任务，按 config 中的 operations 列表依次执行
 - 操作处理器:    download_files / download_folder / download_pattern /
                 run_command / command_output_to_file / command_then_download /
-                vzdump_backup / interactive_shell
+                sqlite_backup / vzdump_backup / interactive_shell
 
 所有“备份什么”由 config.py 声明，本模块只负责“如何执行”。
 """
 
+import hashlib
 import os
 import re
+import shlex
 import shutil
 import stat
+import subprocess
 import time
 import zipfile
 from datetime import datetime
@@ -39,6 +42,8 @@ class BackupClient:
         self.auth = target.get('auth', 'key')
         self.password = target.get('password', '')
         self.timeout = ssh_config.get('timeout', 10)
+        # 远程命令超时（秒）；None 不限制。注意 vzdump 等长任务需要足够大的值
+        self.command_timeout = ssh_config.get('command_timeout')
 
         key_file = ssh_config.get('key_file', 'id_ed25519')
         self.ssh_key_path = Path(__file__).parent.absolute() / key_file
@@ -150,13 +155,13 @@ class BackupClient:
 
     def exec_command(self, cmd: str) -> tuple:
         """执行命令，返回 (exit_status, stdout, stderr)。"""
-        _, stdout, stderr = self.ssh.exec_command(cmd)
+        _, stdout, stderr = self.ssh.exec_command(cmd, timeout=self.command_timeout)
         exit_status = stdout.channel.recv_exit_status()
         return exit_status, stdout.read().decode(errors='replace'), stderr.read().decode(errors='replace')
 
     def exec_command_with_pty(self, cmd: str, input_data: str = '') -> tuple:
         """以 PTY 方式执行命令，返回 (exit_status, stdout, stderr)。"""
-        stdin, stdout, stderr = self.ssh.exec_command(cmd, get_pty=True)
+        stdin, stdout, stderr = self.ssh.exec_command(cmd, get_pty=True, timeout=self.command_timeout)
         if input_data:
             stdin.write(input_data)
             stdin.flush()
@@ -183,6 +188,10 @@ class BackupTask:
 
         # 本次运行中失败的操作描述，非空则整个模块记为失败
         self.failed_items = []
+
+        # PATHS 中的保留与加密策略
+        self.keep_last = paths_config.get('keep_last')
+        self.encrypt_cfg = paths_config.get('encrypt') or None
 
         self.client = BackupClient(self.target, ssh_config)
 
@@ -214,6 +223,58 @@ class BackupTask:
         print(f'  压缩完成: {zip_filename} ({size_mb:.2f} MB)')
         return zip_filepath
 
+    def encrypt_artifact(self, artifact: Path) -> Path:
+        """配置了 age 加密时，加密产物并删除明文 zip；返回最终产物路径。"""
+        if not self.encrypt_cfg:
+            return artifact
+        age_bin = self.encrypt_cfg.get('age_bin', 'age')
+        recipients = self.encrypt_cfg.get('recipients') or []
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        if not recipients or shutil.which(age_bin) is None:
+            self._record_failure('已配置加密但 age 不可用（未安装或缺少 recipients），产物保留明文')
+            print('  ✗ 跳过加密: age 不可用')
+            return artifact
+        encrypted = artifact.with_name(artifact.name + '.age')
+        cmd = [age_bin]
+        for recipient in recipients:
+            cmd += ['-r', recipient]
+        cmd += ['-o', str(encrypted), str(artifact)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            self._record_failure(f'age 加密失败: {e.stderr.decode(errors="replace").strip()}')
+            print('  ✗ 加密失败，产物保留明文')
+            return artifact
+        artifact.unlink()
+        size_mb = encrypted.stat().st_size / (1024 * 1024)
+        print(f'  已加密: {encrypted.name} ({size_mb:.2f} MB)')
+        return encrypted
+
+    def write_sha256(self, artifact: Path) -> None:
+        """为最终产物生成 sha256 校验文件，便于恢复或异地传输后校验。"""
+        digest = hashlib.sha256()
+        with artifact.open('rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                digest.update(chunk)
+        sidecar = artifact.with_name(artifact.name + '.sha256')
+        sidecar.write_text(f'{digest.hexdigest()}  {artifact.name}\n', encoding='utf8')
+        print(f'  校验文件: {sidecar.name}')
+
+    def prune_old_backups(self) -> None:
+        """按 keep_last 清理同前缀旧备份包（连同 .sha256）；None 或 <1 不清理。"""
+        if not self.keep_last or self.keep_last < 1:
+            return
+        artifacts = sorted(
+            (p for p in self.backup_path.glob(f'{self.zip_prefix}_*.zip*')
+             if p.suffix in ('.zip', '.age')),
+            key=lambda p: p.name, reverse=True,
+        )
+        for old in artifacts[self.keep_last:]:
+            old.with_name(old.name + '.sha256').unlink(missing_ok=True)
+            old.unlink(missing_ok=True)
+            print(f'  已清理旧备份: {old.name}')
+
     def cleanup_temp(self) -> None:
         if not self.tmp_path.exists():
             return
@@ -242,11 +303,14 @@ class BackupTask:
                     print(f'  - {msg}')
 
             print('=' * 50)
-            zip_file = self.compress_backup()
+            artifact = self.compress_backup()
+            artifact = self.encrypt_artifact(artifact)
+            self.write_sha256(artifact)
+            self.prune_old_backups()
 
             print('=' * 50)
             print('备份任务完成！')
-            print(f'备份文件位置: {zip_file}')
+            print(f'备份文件位置: {artifact}')
             print('=' * 50)
 
         except Exception as e:
@@ -395,11 +459,46 @@ class BackupTask:
 
         file_name = Path(dump_path).name
         local_file = self._safe_local_path(dest, file_name)
-        if self.client.download_file(dump_path, str(local_file)):
-            print(f'  ✓ 已下载: {file_name}')
-        else:
+        if not self.client.download_file(dump_path, str(local_file)):
             self._record_failure(f'下载失败: {dump_path}')
             print(f'  ✗ 下载失败: {file_name}')
+            return
+
+        print(f'  ✓ 已下载: {file_name}')
+        cleanup_tpl = op.get('cleanup_command')
+        if cleanup_tpl:
+            # 自定义清理命令模板，{dump_path} 会替换为解析出的远程路径
+            self.client.exec_command(cleanup_tpl.format(dump_path=dump_path))
+            print('  已执行远程清理')
+        elif op.get('cleanup_remote'):
+            self.client.exec_command(f'rm -f {shlex.quote(dump_path)}')
+            print('  已清理远程文件')
+
+    def _op_sqlite_backup(self, op: dict) -> None:
+        """远程用 sqlite3 .backup 生成一致性快照后下载，避免直接拷贝热库造成损坏。"""
+        dest = self._dest_dir(op)
+        db_path = op['db']
+        sqlite3_bin = op.get('sqlite3_bin', 'sqlite3')
+        snapshot = f"/tmp/bk_snap_{self.module_id}_{int(time.time() * 1000)}.sqlite3"
+        cmd = f'{sqlite3_bin} {shlex.quote(db_path)} ".backup {shlex.quote(snapshot)}"'
+
+        exit_status, _, stderr = self.client.exec_command(cmd)
+        if exit_status != 0:
+            self._record_failure(f'sqlite 快照失败 (exit {exit_status}): {stderr.strip()}')
+            print(f'  ✗ 快照失败: {stderr.strip()}')
+            return
+
+        file_name = Path(db_path).name
+        local_file = self._safe_local_path(dest, file_name)
+        if self.client.download_file(snapshot, str(local_file)):
+            print(f'  ✓ 已下载快照: {file_name}')
+        else:
+            self._record_failure(f'快照下载失败: {snapshot}')
+            print(f'  ✗ 快照下载失败: {file_name}')
+
+        # 快照是纯临时文件，默认用完即删
+        if op.get('cleanup_remote', True):
+            self.client.exec_command(f'rm -f {shlex.quote(snapshot)}')
 
     def _op_vzdump_backup(self, op: dict) -> None:
         """PVE: 循环 LXC -> PTY 执行 vzdump -> 解析归档路径 -> 下载 -> 清理远程。"""

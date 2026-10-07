@@ -20,7 +20,7 @@ config.py       配置（模块注册表 + 每个模块的 operations 列表，�
 ## 安装
 
 ```bash
-pip install paramiko
+pip install -r requirements.txt  # 即 paramiko
 cp config.example.py config.py   # 复制配置模板
 vim config.py                    # 填入实际的服务器信息和凭据
 # 确保有 SSH 密钥文件（脚本目录下 id_ed25519，chmod 600）
@@ -28,12 +28,17 @@ vim config.py                    # 填入实际的服务器信息和凭据
 ssh-keyscan -p 22 192.168.50.12 >> known_hosts
 ```
 
+可选依赖：`sqlite_backup` 操作需要**远程主机**装有 `sqlite3`（如 `apt install sqlite3`）；
+备份加密需要**本地**安装 [age](https://age-encryption.org)（`brew install age`）。
+
 ## 快速开始
 
 ```bash
 python backup_all.py --help        # 查看帮助
 python backup_all.py --list        # 列出所有可用模块
+python backup_all.py --dry-run     # 仅列出将执行的操作，不实际连接
 python backup_all.py --all         # 运行所有备份
+python backup_all.py --all -j 4    # 4 路并发（输出按模块整段打印）
 python backup_all.py -m 12 7 91    # 运行指定模块
 python backup_all.py -m switch     # 仅备份交换机
 ```
@@ -46,11 +51,16 @@ python backup_all.py -m switch     # 仅备份交换机
 
 ```python
 SSH = {'key_file': 'id_ed25519', 'known_hosts': 'known_hosts', 'timeout': 10}
-PATHS = {'base_path': None, 'tmp_dir': 'tmp', 'backup_dir': 'backup'}
+PATHS = {
+    'tmp_dir': 'tmp', 'backup_dir': 'backup',
+    'keep_last': 10,      # 每模块保留最近 N 个备份包，超出自动清理
+    # 'encrypt': {'recipients': ['age1...']},  # age 公钥加密，见下文
+}
 ```
 
 引擎校验主机指纹（`RejectPolicy`）：`known_hosts` 缺失对应主机的指纹时拒绝连接，
-首次使用请用 `ssh-keyscan` 采集（见"安装"一节）。
+首次使用请用 `ssh-keyscan` 采集（见"安装"一节）。`SSH['command_timeout']`
+可限制远程命令时长（秒，默认不限；vzdump 等长任务需足够大）。
 
 ### 模块注册表 `BACKUP_MODULES`
 
@@ -83,7 +93,8 @@ BACKUP_MODULES = {
 | `download_folder` | 递归下载目录 | `dest_subdir`, `remote_path` |
 | `download_pattern` | 目录内按正则筛选下载 | `dest_subdir`, `remote_dir`/`remote_dirs`, `pattern` |
 | `command_output_to_file` | 执行命令并把 stdout 存为文件 | `dest_subdir`, `dest_file`, `command`, 可选 `skip_blank_and_comments` |
-| `command_then_download` | 执行命令→正则解析路径→可选 copy→下载 | `command`, `parse_regex`, 可选 `match_marker`/`copy_command` |
+| `command_then_download` | 执行命令→正则解析路径→可选 copy→下载 | `command`, `parse_regex`, 可选 `match_marker`/`copy_command`/`cleanup_remote`/`cleanup_command` |
+| `sqlite_backup` | 远程 sqlite3 一致性快照后下载（热库安全） | `db`, 可选 `sqlite3_bin`/`cleanup_remote` |
 | `vzdump_backup` | PVE：循环 LXC 备份→下载→清理远程 | `lxc_ids`, `command_template`, `pty_input`, `parse_regex`, `cleanup_remote` |
 | `interactive_shell` | 交换机：交互式登录→采集→清洗→存盘 | `dest_file`, `login_sequence`, `capture_command`, `clean` |
 
@@ -97,6 +108,17 @@ BACKUP_MODULES = {
     'match_marker': 'Finish dumping in file',
     'parse_regex': r'/tmp/gitea-dump-\d+\.zip',
     'copy_command': 'docker cp $(docker ps -qf "name=gitea"):{dump_path} {dump_path}',
+    'cleanup_remote': True,  # 下载后删除宿主机 /tmp 的 dump
+}
+```
+
+`sqlite_backup` 示例（Bitwarden/Grafana 等热库，避免直接拉取损坏）：
+
+```python
+{
+    'type': 'sqlite_backup',
+    'dest_subdir': 'bitwarden',
+    'db': '/opt/1panel/apps/bitwarden/bitwarden/data/db.sqlite3',
 }
 ```
 
@@ -104,8 +126,8 @@ BACKUP_MODULES = {
 
 | ID | 名称 | 描述 | 操作数 |
 |----|------|------|--------|
-| `12` | 1Panel 12 | Grafana, Prometheus, sun-panel, sub-store | 5 |
-| `oracle` | Oracle | Bitwarden, AdGuardHome, Gitea | 3 |
+| `12` | 1Panel 12 | Grafana, Prometheus, sun-panel, sub-store | 6 |
+| `oracle` | Oracle | Bitwarden, AdGuardHome, Gitea | 4 |
 | `7` | ADG | AdGuardHome, Nginx | 2 |
 | `91` | Mini | Surge 配置 | 1 |
 | `5` | VPN | xray, snell, systemd 服务, openvpn | 4 |
@@ -133,15 +155,23 @@ BACKUP_MODULES = {
 ## 命令行参数
 
 ```
-usage: backup_all.py [-h] [-a] [-m MODULE [MODULE ...]] [-l] [--base-path BASE_PATH]
+usage: backup_all.py [-h] [-a] [-m MODULE [MODULE ...]] [-l] [-j N] [--dry-run] [--base-path BASE_PATH]
 
 选项:
   -h, --help            显示帮助信息
   -a, --all             运行所有备份任务
   -m, --modules MODULE  指定要运行的备份模块ID（可多个）
   -l, --list            列出所有可用的备份模块
-  --base-path BASE_PATH 备份基础路径（默认: 脚本所在目录）
+  -j, --jobs N          并发执行的模块数（默认 1 串行；并发时输出按模块整段打印）
+  --dry-run             仅列出将执行的操作，不实际连接
+  --base-path BASE_PATH 备份基础路径（默认：脚本所在目录）
 ```
+
+## 备份保留、加密与校验
+
+- **保留**：`PATHS['keep_last'] = N`，每个模块只保留最近 N 个备份包（连同 `.sha256`），旧包自动清理；`None` 不限制
+- **加密**：`PATHS['encrypt'] = {'recipients': ['age1...']}` 后，备份 zip 会用 age 公钥加密为 `.zip.age` 并删除明文；生成密钥对 `age-keygen -o key.txt`，解密 `age -d -i key.txt -o dump.zip dump.zip.age`。加密失败或 age 不可用时保留明文并**记为模块失败**
+- **校验**：每个产物自动生成 `<产物>.sha256`，恢复前执行 `shasum -a 256 -c xxx.sha256` 确认完整
 
 ## 安全建议
 
