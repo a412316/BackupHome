@@ -47,3 +47,5 @@ ENV/
 # Windows
 Thumbs.db
 desktop.ini
+
+.mimosa/
